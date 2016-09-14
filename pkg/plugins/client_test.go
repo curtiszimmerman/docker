@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,8 +31,28 @@ func teardownRemotePluginServer() {
 	}
 }
 
+func TestHttpTimeout(t *testing.T) {
+	addr := setupRemotePluginServer()
+	defer teardownRemotePluginServer()
+	stop := false // we need this variable to stop the http server
+	mux.HandleFunc("/hang", func(w http.ResponseWriter, r *http.Request) {
+		for {
+			if stop {
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+	})
+	c, _ := NewClient(addr, &tlsconfig.Options{InsecureSkipVerify: true})
+	_, err := c.callWithRetry("hang", nil, false)
+	stop = true
+	if err == nil || !strings.Contains(err.Error(), "request canceled") {
+		t.Fatalf("The request should be canceled %v", err)
+	}
+}
+
 func TestFailedConnection(t *testing.T) {
-	c, _ := NewClient("tcp://127.0.0.1:1", tlsconfig.Options{InsecureSkipVerify: true})
+	c, _ := NewClient("tcp://127.0.0.1:1", &tlsconfig.Options{InsecureSkipVerify: true})
 	_, err := c.callWithRetry("Service.Method", nil, false)
 	if err == nil {
 		t.Fatal("Unexpected successful connection")
@@ -55,7 +76,7 @@ func TestEchoInputOutput(t *testing.T) {
 		io.Copy(w, r.Body)
 	})
 
-	c, _ := NewClient(addr, tlsconfig.Options{InsecureSkipVerify: true})
+	c, _ := NewClient(addr, &tlsconfig.Options{InsecureSkipVerify: true})
 	var output Manifest
 	err := c.Call("Test.Echo", m, &output)
 	if err != nil {

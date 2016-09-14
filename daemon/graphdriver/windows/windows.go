@@ -5,8 +5,8 @@ package windows
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha512"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
@@ -26,36 +26,47 @@ import (
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/longpath"
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/docker/pkg/system"
+	"github.com/docker/go-units"
 	"github.com/vbatts/tar-split/tar/storage"
+)
+
+// filterDriver is an HCSShim driver type for the Windows Filter driver.
+const filterDriver = 1
+
+var (
+	vmcomputedll            = syscall.NewLazyDLL("vmcompute.dll")
+	hcsExpandSandboxSize    = vmcomputedll.NewProc("ExpandSandboxSize")
+	hcsSandboxSizeSupported = hcsExpandSandboxSize.Find() == nil
 )
 
 // init registers the windows graph drivers to the register.
 func init() {
 	graphdriver.Register("windowsfilter", InitFilter)
-	graphdriver.Register("windowsdiff", InitDiff)
 	reexec.Register("docker-windows-write-layer", writeLayer)
 }
 
-const (
-	// diffDriver is an hcsshim driver type
-	diffDriver = iota
-	// filterDriver is an hcsshim driver type
-	filterDriver
-)
+type checker struct {
+}
+
+func (c *checker) IsMounted(path string) bool {
+	return false
+}
 
 // Driver represents a windows graph driver.
 type Driver struct {
 	// info stores the shim driver information
 	info hcsshim.DriverInfo
+	ctr  *graphdriver.RefCounter
+	// it is safe for windows to use a cache here because it does not support
+	// restoring containers when the daemon dies.
+	cacheMu sync.Mutex
+	cache   map[string]string
 }
-
-var _ graphdriver.DiffGetterDriver = &Driver{}
 
 func isTP5OrOlder() bool {
 	return system.GetOSVersion().Build <= 14300
@@ -64,37 +75,61 @@ func isTP5OrOlder() bool {
 // InitFilter returns a new Windows storage filter driver.
 func InitFilter(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 	logrus.Debugf("WindowsGraphDriver InitFilter at %s", home)
+
+	fsType, err := getFileSystemType(string(home[0]))
+	if err != nil {
+		return nil, err
+	}
+	if strings.ToLower(fsType) == "refs" {
+		return nil, fmt.Errorf("%s is on an ReFS volume - ReFS volumes are not supported", home)
+	}
+
 	d := &Driver{
 		info: hcsshim.DriverInfo{
 			HomeDir: home,
 			Flavour: filterDriver,
 		},
+		cache: make(map[string]string),
+		ctr:   graphdriver.NewRefCounter(&checker{}),
 	}
 	return d, nil
 }
 
-// InitDiff returns a new Windows differencing disk driver.
-func InitDiff(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
-	logrus.Debugf("WindowsGraphDriver InitDiff at %s", home)
-	d := &Driver{
-		info: hcsshim.DriverInfo{
-			HomeDir: home,
-			Flavour: diffDriver,
-		},
+// win32FromHresult is a helper function to get the win32 error code from an HRESULT
+func win32FromHresult(hr uintptr) uintptr {
+	if hr&0x1fff0000 == 0x00070000 {
+		return hr & 0xffff
 	}
-	return d, nil
+	return hr
 }
 
-// String returns the string representation of a driver.
+// getFileSystemType obtains the type of a file system through GetVolumeInformation
+// https://msdn.microsoft.com/en-us/library/windows/desktop/aa364993(v=vs.85).aspx
+func getFileSystemType(drive string) (fsType string, hr error) {
+	var (
+		modkernel32              = syscall.NewLazyDLL("kernel32.dll")
+		procGetVolumeInformation = modkernel32.NewProc("GetVolumeInformationW")
+		buf                      = make([]uint16, 255)
+		size                     = syscall.MAX_PATH + 1
+	)
+	if len(drive) != 1 {
+		hr = errors.New("getFileSystemType must be called with a drive letter")
+		return
+	}
+	drive += `:\`
+	n := uintptr(unsafe.Pointer(nil))
+	r0, _, _ := syscall.Syscall9(procGetVolumeInformation.Addr(), 8, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(drive))), n, n, n, n, n, uintptr(unsafe.Pointer(&buf[0])), uintptr(size), 0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
+	}
+	fsType = syscall.UTF16ToString(buf)
+	return
+}
+
+// String returns the string representation of a driver. This should match
+// the name the graph driver has been registered with.
 func (d *Driver) String() string {
-	switch d.info.Flavour {
-	case diffDriver:
-		return "windowsdiff"
-	case filterDriver:
-		return "windowsfilter"
-	default:
-		return "Unknown driver flavour"
-	}
+	return "windowsfilter"
 }
 
 // Status returns the status of the driver.
@@ -129,10 +164,6 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 }
 
 func (d *Driver) create(id, parent, mountLabel string, readOnly bool, storageOpt map[string]string) error {
-	if len(storageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported for windows")
-	}
-
 	rPId, err := d.resolveID(parent)
 	if err != nil {
 		return err
@@ -195,6 +226,17 @@ func (d *Driver) create(id, parent, mountLabel string, readOnly bool, storageOpt
 		if err := hcsshim.CreateSandboxLayer(d.info, id, parentPath, layerChain); err != nil {
 			return err
 		}
+
+		storageOptions, err := parseStorageOpt(storageOpt)
+		if err != nil {
+			return fmt.Errorf("Failed to parse storage options - %s", err)
+		}
+
+		if hcsSandboxSizeSupported {
+			if err := hcsshim.ExpandSandboxSize(d.info, id, storageOptions.size); err != nil {
+				return err
+			}
+		}
 	}
 
 	if _, err := os.Lstat(d.dir(parent)); err != nil {
@@ -229,7 +271,7 @@ func (d *Driver) Remove(id string) error {
 	return hcsshim.DestroyLayer(d.info, rID)
 }
 
-// Get returns the rootfs path for the id. This will mount the dir at it's given path.
+// Get returns the rootfs path for the id. This will mount the dir at its given path.
 func (d *Driver) Get(id, mountLabel string) (string, error) {
 	logrus.Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, mountLabel)
 	var dir string
@@ -238,17 +280,23 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if count := d.ctr.Increment(rID); count > 1 {
+		return d.cache[rID], nil
+	}
 
 	// Getting the layer paths must be done outside of the lock.
 	layerChain, err := d.getLayerChain(rID)
 	if err != nil {
+		d.ctr.Decrement(rID)
 		return "", err
 	}
 
 	if err := hcsshim.ActivateLayer(d.info, rID); err != nil {
+		d.ctr.Decrement(rID)
 		return "", err
 	}
 	if err := hcsshim.PrepareLayer(d.info, rID, layerChain); err != nil {
+		d.ctr.Decrement(rID)
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
 			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
 		}
@@ -257,11 +305,15 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 
 	mountPath, err := hcsshim.GetLayerMountPath(d.info, rID)
 	if err != nil {
+		d.ctr.Decrement(rID)
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
 			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
 		}
 		return "", err
 	}
+	d.cacheMu.Lock()
+	d.cache[rID] = mountPath
+	d.cacheMu.Unlock()
 
 	// If the layer has a mount path, use that. Otherwise, use the
 	// folder path.
@@ -282,6 +334,12 @@ func (d *Driver) Put(id string) error {
 	if err != nil {
 		return err
 	}
+	if count := d.ctr.Decrement(rID); count > 0 {
+		return nil
+	}
+	d.cacheMu.Lock()
+	delete(d.cache, rID)
+	d.cacheMu.Unlock()
 
 	if err := hcsshim.UnprepareLayer(d.info, rID); err != nil {
 		return err
@@ -390,20 +448,6 @@ func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
 // new layer in bytes.
 // The layer should not be mounted when calling this function
 func (d *Driver) ApplyDiff(id, parent string, diff archive.Reader) (int64, error) {
-	if d.info.Flavour == diffDriver {
-		start := time.Now().UTC()
-		logrus.Debugf("WindowsGraphDriver ApplyDiff: Start untar layer")
-		destination := d.dir(id)
-		destination = filepath.Dir(destination)
-		size, err := chrootarchive.ApplyUncompressedLayer(destination, diff, nil)
-		if err != nil {
-			return 0, err
-		}
-		logrus.Debugf("WindowsGraphDriver ApplyDiff: Untar time: %vs", time.Now().UTC().Sub(start).Seconds())
-
-		return size, nil
-	}
-
 	var layerChain []string
 	if parent != "" {
 		rPId, err := d.resolveID(parent)
@@ -455,78 +499,6 @@ func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
 	defer d.Put(id)
 
 	return archive.ChangesSize(layerFs, changes), nil
-}
-
-// CustomImageInfo is the object returned by the driver describing the base
-// image.
-type CustomImageInfo struct {
-	ID          string
-	Name        string
-	Version     string
-	Path        string
-	Size        int64
-	CreatedTime time.Time
-	OSVersion   string   `json:"-"`
-	OSFeatures  []string `json:"-"`
-}
-
-// GetCustomImageInfos returns the image infos for window specific
-// base images which should always be present.
-func (d *Driver) GetCustomImageInfos() ([]CustomImageInfo, error) {
-	strData, err := hcsshim.GetSharedBaseImages()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to restore base images: %s", err)
-	}
-
-	type customImageInfoList struct {
-		Images []CustomImageInfo
-	}
-
-	var infoData customImageInfoList
-
-	if err = json.Unmarshal([]byte(strData), &infoData); err != nil {
-		err = fmt.Errorf("JSON unmarshal returned error=%s", err)
-		logrus.Error(err)
-		return nil, err
-	}
-
-	var images []CustomImageInfo
-
-	for _, imageData := range infoData.Images {
-		folderName := filepath.Base(imageData.Path)
-
-		// Use crypto hash of the foldername to generate a docker style id.
-		h := sha512.Sum384([]byte(folderName))
-		id := fmt.Sprintf("%x", h[:32])
-
-		if err := d.Create(id, "", "", nil); err != nil {
-			return nil, err
-		}
-		// Create the alternate ID file.
-		if err := d.setID(id, folderName); err != nil {
-			return nil, err
-		}
-
-		imageData.ID = id
-
-		// For now, hard code that all base images except nanoserver depend on win32k support
-		if imageData.Name != "NanoServer" {
-			imageData.OSFeatures = append(imageData.OSFeatures, "win32k")
-		}
-
-		versionData := strings.Split(imageData.Version, ".")
-		if len(versionData) != 4 {
-			logrus.Warn("Could not parse Windows version %s", imageData.Version)
-		} else {
-			// Include just major.minor.build, skip the fourth version field, which does not influence
-			// OS compatibility.
-			imageData.OSVersion = strings.Join(versionData[:3], ".")
-		}
-
-		images = append(images, imageData)
-	}
-
-	return images, nil
 }
 
 // GetMetadata returns custom driver information.
@@ -624,7 +596,7 @@ func writeLayerFromTar(r archive.Reader, w hcsshim.LayerWriter) (int64, error) {
 			}
 			buf.Reset(w)
 
-			// Add the Hyper-V Virutal Machine group ACE to the security descriptor
+			// Add the Hyper-V Virtual Machine group ACE to the security descriptor
 			// for TP5 so that Xenons can access all files. This is not necessary
 			// for post-TP5 builds.
 			if isTP5OrOlder() {
@@ -859,4 +831,28 @@ func (d *Driver) DiffGetter(id string) (graphdriver.FileGetCloser, error) {
 	}
 
 	return &fileGetCloserWithBackupPrivileges{d.dir(id)}, nil
+}
+
+type storageOptions struct {
+	size uint64
+}
+
+func parseStorageOpt(storageOpt map[string]string) (*storageOptions, error) {
+	options := storageOptions{}
+
+	// Read size to change the block device size per container.
+	for key, val := range storageOpt {
+		key := strings.ToLower(key)
+		switch key {
+		case "size":
+			size, err := units.RAMInBytes(val)
+			if err != nil {
+				return nil, err
+			}
+			options.size = uint64(size)
+		default:
+			return nil, fmt.Errorf("Unknown storage option: %s", key)
+		}
+	}
+	return &options, nil
 }

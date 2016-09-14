@@ -21,7 +21,7 @@ const (
 	filePerm      = 0644
 )
 
-func (sb *sandbox) startResolver() {
+func (sb *sandbox) startResolver(restore bool) {
 	sb.resolverOnce.Do(func() {
 		var err error
 		sb.resolver = NewResolver(sb)
@@ -31,10 +31,16 @@ func (sb *sandbox) startResolver() {
 			}
 		}()
 
-		err = sb.rebuildDNS()
-		if err != nil {
-			log.Errorf("Updating resolv.conf failed for container %s, %q", sb.ContainerID(), err)
-			return
+		// In the case of live restore container is already running with
+		// right resolv.conf contents created before. Just update the
+		// external DNS servers from the restored sandbox for embedded
+		// server to use.
+		if !restore {
+			err = sb.rebuildDNS()
+			if err != nil {
+				log.Errorf("Updating resolv.conf failed for container %s, %q", sb.ContainerID(), err)
+				return
+			}
 		}
 		sb.resolver.SetExtServers(sb.extDNS)
 
@@ -139,6 +145,16 @@ func (sb *sandbox) updateParentHosts() error {
 	return nil
 }
 
+func (sb *sandbox) restorePath() {
+	if sb.config.resolvConfPath == "" {
+		sb.config.resolvConfPath = defaultPrefix + "/" + sb.id + "/resolv.conf"
+	}
+	sb.config.resolvConfHashFile = sb.config.resolvConfPath + ".hash"
+	if sb.config.hostsPath == "" {
+		sb.config.hostsPath = defaultPrefix + "/" + sb.id + "/hosts"
+	}
+}
+
 func (sb *sandbox) setupDNS() error {
 	var newRC *resolvconf.File
 
@@ -239,7 +255,7 @@ func (sb *sandbox) updateDNS(ipv6Enabled bool) error {
 	if currHash != "" && currHash != currRC.Hash {
 		// Seems the user has changed the container resolv.conf since the last time
 		// we checked so return without doing anything.
-		log.Infof("Skipping update of resolv.conf file with ipv6Enabled: %t because file was touched by user", ipv6Enabled)
+		//log.Infof("Skipping update of resolv.conf file with ipv6Enabled: %t because file was touched by user", ipv6Enabled)
 		return nil
 	}
 
@@ -259,14 +275,22 @@ func (sb *sandbox) updateDNS(ipv6Enabled bool) error {
 	if err != nil {
 		return err
 	}
-	if err = ioutil.WriteFile(tmpHashFile.Name(), []byte(newRC.Hash), filePerm); err != nil {
+	if err = tmpHashFile.Chmod(filePerm); err != nil {
+		tmpHashFile.Close()
+		return err
+	}
+	_, err = tmpHashFile.Write([]byte(newRC.Hash))
+	if err1 := tmpHashFile.Close(); err == nil {
+		err = err1
+	}
+	if err != nil {
 		return err
 	}
 	return os.Rename(tmpHashFile.Name(), hashFile)
 }
 
 // Embedded DNS server has to be enabled for this sandbox. Rebuild the container's
-// resolv.conf by doing the follwing
+// resolv.conf by doing the following
 // - Save the external name servers in resolv.conf in the sandbox
 // - Add only the embedded server's IP to container's resolv.conf
 // - If the embedded server needs any resolv.conf options add it to the current list

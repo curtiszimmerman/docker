@@ -8,11 +8,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/pkg/integration/checker"
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/versions"
 	"github.com/go-check/check"
 )
 
@@ -89,7 +90,7 @@ func (s *DockerSuite) TestApiStatsNetworkStats(c *check.C) {
 
 	// Retrieve the container address
 	contIP := findContainerIP(c, id, "bridge")
-	numPings := 4
+	numPings := 1
 
 	var preRxPackets uint64
 	var preTxPackets uint64
@@ -107,9 +108,22 @@ func (s *DockerSuite) TestApiStatsNetworkStats(c *check.C) {
 	if runtime.GOOS == "windows" {
 		countParam = "-n" // Ping count parameter is -n on Windows
 	}
-	pingout, err := exec.Command("ping", contIP, countParam, strconv.Itoa(numPings)).Output()
-	pingouts := string(pingout[:])
+	pingout, err := exec.Command("ping", contIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
+	if err != nil && runtime.GOOS == "linux" {
+		// If it fails then try a work-around, but just for linux.
+		// If this fails too then go back to the old error for reporting.
+		//
+		// The ping will sometimes fail due to an apparmor issue where it
+		// denies access to the libc.so.6 shared library - running it
+		// via /lib64/ld-linux-x86-64.so.2 seems to work around it.
+		pingout2, err2 := exec.Command("/lib64/ld-linux-x86-64.so.2", "/bin/ping", contIP, "-c", strconv.Itoa(numPings)).CombinedOutput()
+		if err2 == nil {
+			pingout = pingout2
+			err = err2
+		}
+	}
 	c.Assert(err, checker.IsNil)
+	pingouts := string(pingout[:])
 	nwStatsPost := getNetworkStats(c, id)
 	for _, v := range nwStatsPost {
 		postRxPackets += v.RxPackets
@@ -132,18 +146,24 @@ func (s *DockerSuite) TestApiStatsNetworkStatsVersioning(c *check.C) {
 	out, _ := runSleepingContainer(c)
 	id := strings.TrimSpace(out)
 	c.Assert(waitRun(id), checker.IsNil)
+	wg := sync.WaitGroup{}
 
 	for i := 17; i <= 21; i++ {
-		apiVersion := fmt.Sprintf("v1.%d", i)
-		statsJSONBlob := getVersionedStats(c, id, apiVersion)
-		if versions.LessThan(apiVersion, "v1.21") {
-			c.Assert(jsonBlobHasLTv121NetworkStats(statsJSONBlob), checker.Equals, true,
-				check.Commentf("Stats JSON blob from API %s %#v does not look like a <v1.21 API stats structure", apiVersion, statsJSONBlob))
-		} else {
-			c.Assert(jsonBlobHasGTE121NetworkStats(statsJSONBlob), checker.Equals, true,
-				check.Commentf("Stats JSON blob from API %s %#v does not look like a >=v1.21 API stats structure", apiVersion, statsJSONBlob))
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			apiVersion := fmt.Sprintf("v1.%d", i)
+			statsJSONBlob := getVersionedStats(c, id, apiVersion)
+			if versions.LessThan(apiVersion, "v1.21") {
+				c.Assert(jsonBlobHasLTv121NetworkStats(statsJSONBlob), checker.Equals, true,
+					check.Commentf("Stats JSON blob from API %s %#v does not look like a <v1.21 API stats structure", apiVersion, statsJSONBlob))
+			} else {
+				c.Assert(jsonBlobHasGTE121NetworkStats(statsJSONBlob), checker.Equals, true,
+					check.Commentf("Stats JSON blob from API %s %#v does not look like a >=v1.21 API stats structure", apiVersion, statsJSONBlob))
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 func getNetworkStats(c *check.C, id string) map[string]types.NetworkStats {

@@ -29,13 +29,13 @@ type Spec struct {
 	Root Root `json:"root"`
 	// Hostname is the container's host name.
 	Hostname string `json:"hostname,omitempty"`
-	// Mounts profile configuration for adding mounts to the container's filesystem.
+	// Mounts profiles configuration for adding mounts to the container's filesystem.
 	Mounts []Mount `json:"mounts"`
 }
 
 // Windows contains platform specific configuration for Windows based containers.
 type Windows struct {
-	// Resources contain information for handling resource constraints for the container
+	// Resources contains information for handling resource constraints for the container
 	Resources *Resources `json:"resources,omitempty"`
 	// Networking contains the platform specific network settings for the container.
 	Networking *Networking `json:"networking,omitempty"`
@@ -86,6 +86,8 @@ type Platform struct {
 	OS string `json:"os"`
 	// Arch is the architecture
 	Arch string `json:"arch"`
+	// OSVersion is the version of the operating system.
+	OSVersion string `json:"os.version,omitempty"`
 }
 
 // Mount specifies a mount for a container.
@@ -141,7 +143,7 @@ type CPU struct {
 	Percent *int64 `json:"percent,omitempty"`
 }
 
-// Network network resource management information
+// Network contains network resource management information
 type Network struct {
 	// Bandwidth is the maximum egress bandwidth in bytes per second
 	Bandwidth *uint64 `json:"bandwidth,omitempty"`
